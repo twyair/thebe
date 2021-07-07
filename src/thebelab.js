@@ -1,6 +1,12 @@
 import $ from "jquery";
 import CodeMirror from "codemirror/lib/codemirror";
 import "codemirror/lib/codemirror.css";
+import "codemirror/theme/monokai.css";
+import "codemirror/addon/hint/show-hint";
+import "codemirror/addon/display/autorefresh.js";
+
+var Convert = require('ansi-to-html');
+var convert = new Convert();
 
 // make CodeMirror public for loading additional themes
 if (typeof window !== "undefined") {
@@ -25,9 +31,9 @@ import { requireLoader } from "@jupyter-widgets/html-manager";
 
 import { Mode } from "@jupyterlab/codemirror";
 
-import "@jupyterlab/theme-light-extension/style/index.css";
+// import "@jupyterlab/theme-light-extension/style/index.css";
 import "@jupyter-widgets/controls/css/widgets-base.css";
-import "@jupyterlab/rendermime/style/index.css";
+// import "@jupyterlab/rendermime/style/index.css";
 import "./index.css";
 
 // Exposing @jupyter-widgets/base and @jupyter-widgets/controls as amd
@@ -66,15 +72,6 @@ const _defaultOptions = {
   mathjaxConfig: "TeX-AMS_CHTML-full,Safe",
   selector: "[data-executable]",
   outputSelector: "[data-output]",
-  binderOptions: {
-    ref: "master",
-    binderUrl: "https://mybinder.org",
-    savedSession: {
-      enabled: true,
-      maxAge: 86400,
-      storagePrefix: "thebe-binder-",
-    },
-  },
   kernelOptions: {
     path: "/",
     serverSettings: {
@@ -83,41 +80,9 @@ const _defaultOptions = {
   },
 };
 
-let _pageConfigData = undefined;
-function getPageConfig(key) {
-  if (typeof window === "undefined") return;
-  if (!_pageConfigData) {
-    _pageConfigData = {};
-    $("script[type='text/x-thebe-config']").map((i, el) => {
-      if (el.getAttribute("data-thebe-loaded")) {
-        // already loaded
-        return;
-      }
-      el.setAttribute("data-thebe-loaded", "true");
-      let thebeConfig = undefined;
-      try {
-        thebeConfig = eval(`(${el.textContent})`);
-        if (thebeConfig) {
-          console.log("loading thebe config", thebeConfig);
-          $.extend(true, _pageConfigData, thebeConfig);
-        } else {
-          console.log("No thebeConfig found in ", el);
-        }
-      } catch (e) {
-        console.error("Error loading thebe config", e, el.textContent);
-      }
-    });
-  }
-  return _pageConfigData[key];
-}
-
 export function mergeOptions(options) {
-  // merge options from various sources
-  // call > page > defaults
   let merged = {};
-  getPageConfig();
   $.extend(true, merged, _defaultOptions);
-  $.extend(true, merged, _pageConfigData);
   if (options) $.extend(true, merged, options);
   return merged;
 }
@@ -147,10 +112,11 @@ function getRenderers(options) {
 }
 // rendering cells
 
-function renderCell(element, options) {
+function renderCell(element, manager1, options) {
   // render a single cell
   // element should be a `<pre>` tag with some code in it
-  let mergedOptions = mergeOptions({ options });
+  let mergedOptions = mergeOptions(options);
+  mergedOptions.manager = manager1;
   let $cell = $("<div class='thebelab-cell'/>");
   let $element = $(element);
   let $output = $element.next(mergedOptions.outputSelector);
@@ -190,36 +156,6 @@ function renderCell(element, options) {
 
   let $cm_element = $("<div class='thebelab-input'>");
   $cell.append($cm_element);
-  $cell.append(
-    $("<button class='thebelab-button thebelab-run-button'>")
-      .text("run")
-      .attr("title", "run this cell")
-      .click(execute)
-  );
-  $cell.append(
-    $("<button class='thebelab-button thebelab-restart-button'>")
-      .text("restart")
-      .attr("title", "restart the kernel")
-      .click(restart)
-  );
-  $cell.append(
-    $("<button class='thebelab-button thebelab-restartall-button'>")
-      .text("restart & run all")
-      .attr("title", "restart the kernel and run all cells")
-      .click(restartAndRunAll)
-  );
-  let kernelResolve, kernelReject;
-  let kernelPromise = new Promise((resolve, reject) => {
-    kernelResolve = resolve;
-    kernelReject = reject;
-  });
-  kernelPromise.then((kernel) => {
-    $cell.data("kernel", kernel);
-    manager.registerWithKernel(kernel);
-    return kernel;
-  });
-  $cell.data("kernel-promise-resolve", kernelResolve);
-  $cell.data("kernel-promise-reject", kernelReject);
 
   if ($output.length && mergedOptions.predefinedOutput) {
     outputArea.model.add({
@@ -240,64 +176,129 @@ function renderCell(element, options) {
     });
   }
 
-  function execute() {
+  function get_kernel() {
     let kernel = $cell.data("kernel");
-    let code = cm.getValue();
     if (!kernel) {
       console.debug("No kernel connected");
       setOutputText();
       events.trigger("request-kernel");
     }
-    kernelPromise.then((kernel) => {
-      try {
-        outputArea.future = kernel.requestExecute({ code: code });
-      } catch (error) {
-        outputArea.model.clear();
-        outputArea.model.add({
-          output_type: "stream",
-          name: "stderr",
-          text: `Failed to execute. ${error} Please refresh the page.`,
-        });
-      }
+    return kernel;
+  }
+
+  function handle_error(error) {
+    outputArea.model.clear();
+    outputArea.model.add({
+      output_type: "stream",
+      name: "stderr",
+      text: `Failed to execute. ${error} Please refresh the page.`,
     });
+  }
+
+  function execute() {
+    const kernel = get_kernel();
+    const code = cm.getValue();
+    try {
+      outputArea.future = kernel.requestExecute({ code: code });
+      if (mergedOptions.on_execute) {
+        mergedOptions.on_execute(cm);
+      }
+      const observer = new MutationObserver((mutation_list, observer) => {
+        if (mergedOptions.on_output_change) {
+          mergedOptions.on_output_change(outputArea.node);
+        }
+      })
+      observer.observe(outputArea.node, { childList: true, subtree: true, });
+    } catch (error) {
+      handle_error(error);
+    }
     return false;
   }
 
-  function restart() {
-    let kernel = $cell.data("kernel");
-    if (kernel) {
-      return kernelPromise.then(async (kernel) => {
-        await kernel.restart();
-        return kernel;
+  function code_completion() {
+    const kernel = get_kernel();
+    let code = cm.getValue();
+    const cursor = cm.getDoc().getCursor();
+    try {
+      kernel.requestComplete({ code: code, cursor_pos: cm.getDoc().indexFromPos(cursor) }).then((value) => {
+        const from = cm.getDoc().posFromIndex(value.content.cursor_start);
+        const to = cm.getDoc().posFromIndex(value.content.cursor_end);
+        cm.showHint({container: $cell[0], hint: () => { return {
+          from: from,
+          to: to,
+          list: value.content.matches
+        }}});
       });
+    } catch (error) {
+      handle_error(error);
     }
-    return Promise.resolve(kernel);
   }
 
-  function restartAndRunAll() {
-    if (window.thebelab) {
-      window.thebelab.cells.map((idx, { setOutputText }) => setOutputText());
+  let docs_box = undefined;
+
+  function close_docs_box() {
+    if (docs_box) {
+      $cell[0].removeChild(docs_box);
+      docs_box = undefined;
     }
-    restart().then((kernel) => {
-      if (!window.thebelab) return kernel;
-      // Note, the jquery map is overridden, and is in the opposite order of native JS
-      window.thebelab.cells.map((idx, { execute }) => execute());
-      return kernel;
-    });
+  }
+
+  function code_introspection() {
+    close_docs_box();
+    const kernel = get_kernel();
+    const code = cm.getValue();
+    const cursor = cm.getDoc().getCursor();
+    const coords = cm.cursorCoords(cursor);
+    console.log(coords);
+    try {
+      kernel.requestInspect({
+        code: code,
+        cursor_pos: cm.getDoc().indexFromPos(cursor),
+        detail_level: 1
+      }).then((msg) => {
+        const content = msg.content;
+        if (content.status === "ok" && content.found) {
+          const text = convert.toHtml(content.data["text/plain"]);
+          var htmlNode =document.createElement("pre");
+          htmlNode.classList.add("docs-tooltip");
+          htmlNode.innerHTML = text;
+          htmlNode.style.position = "absolute";
+          htmlNode.style.top = "";
+          htmlNode.style.left = "";
+          htmlNode.style.right = "";
+          $cell.append(htmlNode);
+          docs_box = htmlNode;
+          htmlNode.addEventListener("dblclick", close_docs_box);
+        } else {
+          console.log(content);
+        }
+      });
+    } catch (error) {
+      handle_error(error);
+    }
   }
 
   let theDiv = document.createElement("div");
   $cell.append(theDiv);
   Widget.attach(outputArea, theDiv);
 
-  const mode = $element.data("language") || "python";
   const isReadOnly = $element.data("readonly");
   const required = {
     value: source,
-    mode: mode,
+    theme: mergedOptions.codeMirrorConfig.theme,
     extraKeys: {
       "Shift-Enter": execute,
+      "Ctrl-Space": code_completion,
+      "Alt": () => {
+        if (docs_box) {
+          close_docs_box();
+        } else {
+          cm.display.input.blur();
+        }
+      },
+      "Shift-Tab": code_introspection,
     },
+    autoRefresh:true,
   };
   if (isReadOnly !== undefined) {
     required.readOnly = isReadOnly !== false; //overrides codeMirrorConfig.readOnly for cell
@@ -305,10 +306,8 @@ function renderCell(element, options) {
 
   // Gets CodeMirror config if it exists
   let codeMirrorOptions = {};
-  if ("binderOptions" in mergedOptions) {
-    if ("codeMirrorConfig" in mergedOptions.binderOptions) {
-      codeMirrorOptions = mergedOptions.binderOptions.codeMirrorConfig;
-    }
+  if ("codeMirrorConfig" in mergedOptions) {
+    codeMirrorOptions = mergedOptions.codeMirrorConfig;
   }
 
   // Dynamically loads CSS for a given theme
@@ -318,36 +317,30 @@ function renderCell(element, options) {
 
   let codeMirrorConfig = Object.assign(codeMirrorOptions || {}, required);
   let cm = new CodeMirror($cm_element[0], codeMirrorConfig);
-  Mode.ensure(mode).then((modeSpec) => {
-    cm.setOption("mode", mode);
+  Mode.ensure(codeMirrorConfig.mode).then((modeSpec) => {
+    cm.setOption("mode", codeMirrorConfig.mode);
   });
   if (cm.isReadOnly()) {
     cm.display.lineDiv.setAttribute("data-readonly", "true");
     $cm_element[0].setAttribute("data-readonly", "true");
     $cell.attr("data-readonly", "true");
   }
-  return { cell: $cell, execute, setOutputText };
+  return { cell: $cell, execute, setOutputText, cm: cm };
 }
 
-export function renderAllCells({ selector = _defaultOptions.selector } = {}) {
+export function renderAllCells(manager, { selector = _defaultOptions.selector } = {}, options) {
   // render all elements matching `selector` as cells.
   // by default, this is all cells with `data-executable`
 
-  let manager = new ThebeManager({
-    loader: requireLoader,
-  });
-
   return $(selector).map((i, cell) =>
-    renderCell(cell, {
-      manager: manager,
-    })
+    renderCell(cell, manager, options)
   );
 }
 
 export function hookupKernel(kernel, cells) {
   // hooks up cells to the kernel
   cells.map((i, { cell }) => {
-    $(cell).data("kernel-promise-resolve")(kernel);
+    $(cell).data("kernel", kernel);
   });
 }
 
@@ -378,215 +371,6 @@ export function requestKernel(kernelOptions) {
     });
 }
 
-export function requestBinderKernel({ binderOptions, kernelOptions }) {
-  // request a Kernel from Binder
-  // this strings together requestBinder and requestKernel.
-  // returns a Promise for a running Kernel.
-  return requestBinder(binderOptions).then((serverSettings) => {
-    kernelOptions.serverSettings = serverSettings;
-    return requestKernel(kernelOptions);
-  });
-}
-
-export function requestBinder({
-  repo,
-  ref = "master",
-  binderUrl = null,
-  repoProvider = "",
-  savedSession = _defaultOptions.binderOptions.savedSession,
-} = {}) {
-  // request a server from Binder
-  // returns a Promise that will resolve with a serverSettings dict
-
-  // populate from defaults
-  let defaults = mergeOptions().binderOptions;
-  if (!repo) {
-    repo = defaults.repo;
-    repoProvider = "";
-  }
-  console.log("binder url", binderUrl, defaults);
-  binderUrl = binderUrl || defaults.binderUrl;
-  ref = ref || defaults.ref;
-  savedSession = savedSession || defaults.savedSession;
-  savedSession = $.extend(true, defaults.savedSession, savedSession);
-
-  let url;
-
-  if (repoProvider.toLowerCase() === "git") {
-    // trim trailing or leading '/' on repo
-    repo = repo.replace(/(^\/)|(\/?$)/g, "");
-    // trailing / on binderUrl
-    binderUrl = binderUrl.replace(/(\/?$)/g, "");
-    //convert to URL acceptable string. Required for git
-    repo = encodeURIComponent(repo);
-
-    url = binderUrl + "/build/git/" + repo + "/" + ref;
-  } else if (repoProvider.toLowerCase() === "gitlab") {
-    // trim gitlab.com from repo
-    repo = repo.replace(/^(https?:\/\/)?gitlab.com\//, "");
-    // trim trailing or leading '/' on repo
-    repo = repo.replace(/(^\/)|(\/?$)/g, "");
-    // trailing / on binderUrl
-    binderUrl = binderUrl.replace(/(\/?$)/g, "");
-    //convert to URL acceptable string. Required for gitlab
-    repo = encodeURIComponent(repo);
-
-    url = binderUrl + "/build/gl/" + repo + "/" + ref;
-  } else {
-    // trim github.com from repo
-    repo = repo.replace(/^(https?:\/\/)?github.com\//, "");
-    // trim trailing or leading '/' on repo
-    repo = repo.replace(/(^\/)|(\/?$)/g, "");
-    // trailing / on binderUrl
-    binderUrl = binderUrl.replace(/(\/?$)/g, "");
-
-    url = binderUrl + "/build/gh/" + repo + "/" + ref;
-  }
-  console.log("Binder build URL", url);
-
-  const storageKey = savedSession.storagePrefix + url;
-
-  async function getExistingServer() {
-    if (!savedSession.enabled) {
-      return;
-    }
-    let storedInfoJSON = window.localStorage.getItem(storageKey);
-    if (storedInfoJSON == null) {
-      console.debug("No session saved in ", storageKey);
-      return;
-    }
-    console.debug("Saved binder session detected");
-    let existingServer = JSON.parse(storedInfoJSON);
-    let lastUsed = new Date(existingServer.lastUsed);
-    let ageSeconds = (new Date() - lastUsed) / 1000;
-    if (ageSeconds > savedSession.maxAge) {
-      console.debug(
-        `Not using expired binder session for ${existingServer.url} from ${lastUsed}`
-      );
-      window.localStorage.removeItem(storageKey);
-      return;
-    }
-    let settings = ServerConnection.makeSettings({
-      baseUrl: existingServer.url,
-      wsUrl: "ws" + existingServer.url.slice(4),
-      token: existingServer.token,
-      appendToken: true,
-    });
-    try {
-      await KernelAPI.listRunning(settings);
-    } catch (err) {
-      console.log(
-        "Saved binder connection appears to be invalid, requesting new session",
-        err
-      );
-      window.localStorage.removeItem(storageKey);
-      return;
-    }
-    // refresh lastUsed timestamp in stored info
-    existingServer.lastUsed = new Date();
-    window.localStorage.setItem(storageKey, JSON.stringify(existingServer));
-    console.log(
-      `Saved binder session is valid, reusing connection to ${existingServer.url}`
-    );
-    return settings;
-  }
-
-  return new Promise(async (resolve, reject) => {
-    // if binder already spawned our server and we remember the creds
-    // try to reuse it
-    let existingServer;
-    try {
-      existingServer = await getExistingServer();
-    } catch (err) {
-      // catch unhandled errors such as JSON parse errors,
-      // invalid formats, permission error on localStorage, etc.
-      console.error("Failed to load existing server connection", err);
-    }
-
-    if (existingServer) {
-      // found an existing server
-      // return it instead of requesting a new one
-      resolve(existingServer);
-      return;
-    }
-
-    events.trigger("status", {
-      status: "building",
-      message: "Requesting build from binder",
-    });
-
-    let es = new EventSource(url);
-    es.onerror = (err) => {
-      console.error("Lost connection to " + url, err);
-      es.close();
-      events.trigger("status", {
-        status: "failed",
-        message: "Lost connection to Binder",
-        error: err,
-      });
-      reject(new Error(err));
-    };
-    let phase = null;
-    es.onmessage = (evt) => {
-      let msg = JSON.parse(evt.data);
-      if (msg.phase && msg.phase !== phase) {
-        phase = msg.phase.toLowerCase();
-        console.log("Binder phase: " + phase);
-        let status = phase;
-        if (status === "ready") {
-          status = "server-ready";
-        }
-        events.trigger("status", {
-          status: status,
-          message: "Binder is " + phase,
-          binderMessage: msg.message,
-        });
-      }
-      if (msg.message) {
-        console.log("Binder: " + msg.message);
-      }
-      switch (msg.phase) {
-        case "failed":
-          console.error("Failed to build", url, msg);
-          es.close();
-          reject(new Error(msg));
-          break;
-        case "ready":
-          es.close();
-          try {
-            // save the current connection url+token to reuse later
-            window.localStorage.setItem(
-              storageKey,
-              JSON.stringify({
-                url: msg.url,
-                token: msg.token,
-                lastUsed: new Date(),
-              })
-            );
-          } catch (e) {
-            // storage quota full, gently ignore nonfatal error
-            console.warn(
-              "Couldn't save thebe binder connection info to local storage",
-              e
-            );
-          }
-
-          resolve(
-            ServerConnection.makeSettings({
-              baseUrl: msg.url,
-              wsUrl: "ws" + msg.url.slice(4),
-              token: msg.token,
-              appendToken: true,
-            })
-          );
-          break;
-        default:
-        // console.log(msg);
-      }
-    };
-  });
-}
-
 /**
  * Do it all in one go.
 
@@ -610,134 +394,29 @@ export function bootstrap(options) {
   if (options.preRenderHook) {
     options.preRenderHook();
   }
-  if (options.stripPrompts) {
-    stripPrompts(options.stripPrompts);
-  }
-  if (options.stripOutputPrompts) {
-    stripOutputPrompts(options.stripOutputPrompts);
-  }
 
-  // bootstrap thebelab on the page
-  let cells = renderAllCells({
-    selector: options.selector,
+  let manager = new ThebeManager({
+    loader: requireLoader,
   });
 
+  // bootstrap thebelab on the page
+  let cells = renderAllCells(manager, {
+    selector: options.selector,
+  }, options);
+
   function getKernel() {
-    if (options.binderOptions.repo) {
-      return requestBinderKernel({
-        binderOptions: options.binderOptions,
-        kernelOptions: options.kernelOptions,
-      });
-    } else {
-      return requestKernel(options.kernelOptions);
-    }
+    return requestKernel(options.kernelOptions);
   }
 
   let kernelPromise;
-  if (options.requestKernel) {
-    kernelPromise = getKernel();
-  } else {
-    kernelPromise = new Promise((resolve, reject) => {
-      events.one("request-kernel", () => {
-        getKernel().then(resolve).catch(reject);
-      });
-    });
-  }
+  kernelPromise = getKernel();
 
   kernelPromise.then((kernel) => {
     // debug
+    manager.registerWithKernel(kernel);
     if (typeof window !== "undefined") window.thebeKernel = kernel;
     hookupKernel(kernel, cells);
   });
   if (window.thebelab) window.thebelab.cells = cells;
   return kernelPromise;
-}
-
-function splitCell(element, { inPrompt, continuationPrompt } = {}) {
-  let rawText = element.text().trim();
-  if (rawText.indexOf(inPrompt) == -1) {
-    return element;
-  }
-  let cells = [];
-  let cell = null;
-  rawText.split("\n").map((line) => {
-    line = line.trim();
-    if (line.slice(0, inPrompt.length) === inPrompt) {
-      // line with a prompt
-      line = line.slice(inPrompt.length) + "\n";
-      if (cell) {
-        cell += line;
-      } else {
-        cell = line;
-      }
-    } else if (
-      continuationPrompt &&
-      line.slice(0, continuationPrompt.length) === continuationPrompt
-    ) {
-      // line with a continuation prompt
-      cell += line.slice(continuationPrompt.length) + "\n";
-    } else {
-      // output line
-      if (cell) {
-        cells.push(cell);
-        cell = null;
-      }
-    }
-  });
-  if (cell) {
-    cells.push(cell);
-  }
-  // console.log("cells: ", cells);
-  // clear the parent element
-  element.html("");
-  // add the thebe-able cells
-  cells.map((cell) => {
-    element.append($("<pre>").text(cell).attr("data-executable", "true"));
-  });
-}
-
-function splitCellOutputPrompt(element, { outPrompt } = {}) {
-  let rawText = element.text().trim();
-  if (rawText.indexOf(outPrompt) == -1) {
-    return element;
-  }
-  let cells = [];
-  let cell = null;
-  rawText.split("\n").map((line) => {
-    line = line.trim();
-    if (line.slice(0, outPrompt.length) === outPrompt) {
-      // output line
-      if (cell) {
-        cells.push(cell);
-        cell = null;
-      }
-    } else {
-      // input line
-      if (cell) {
-        cell += line + "\n";
-      } else {
-        cell = line + "\n";
-      }
-    }
-  });
-  if (cell) {
-    cells.push(cell);
-  }
-  // console.log("cells: ", cells);
-  // clear the parent element
-  element.html("");
-  // add the thebe-able cells
-  cells.map((cell) => {
-    element.append($("<pre>").text(cell).attr("data-executable", "true"));
-  });
-}
-
-export function stripPrompts(options) {
-  // strip prompts from a
-  $(options.selector).map((i, el) => splitCell($(el), options));
-}
-
-export function stripOutputPrompts(options) {
-  // strip prompts from a
-  $(options.selector).map((i, el) => splitCellOutputPrompt($(el), options));
 }

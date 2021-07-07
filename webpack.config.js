@@ -15,7 +15,7 @@ module.exports = {
   output: {
     filename: "index.js",
     path: path.resolve(__dirname, "lib"),
-    publicPath: "https://unpkg.com/thebe@" + pkg.version + "/lib/",
+    publicPath: "../thebe/lib/",
   },
   plugins: [
     // Not using moment
